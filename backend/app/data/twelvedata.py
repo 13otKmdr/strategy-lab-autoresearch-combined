@@ -18,13 +18,30 @@ from datetime import datetime, timezone, timedelta
 
 import httpx
 
-from app.config import TWELVEDATA_API_KEY, DATABASE_PATH
+from app.config import DATABASE_PATH, PROP_ALLOW_ETF_PROXY_DATA, PROP_PROFILE, TWELVEDATA_API_KEY
+from app.engine.prop_profile import BROAD_RESEARCH_PROFILES
 from app.models.market import Candle, INSTRUMENTS
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.twelvedata.com"
 RATE_LIMIT_DELAY = 8  # seconds between calls (free tier: 8/min)
+
+
+def _prop_profile_blocks_proxy_data(instrument: str) -> bool:
+    """Fail closed when challenge mode would otherwise use ETF proxy prices.
+
+    The DRB/futures sizing engines interpret prices as native futures prices.
+    ETF proxies such as DIA/SPY/QQQ are not on the same tick scale, so they are
+    blocked by default for prop-profile simulations. The cycle falls back to
+    futures-like mock data until a true futures data source is wired in.
+    """
+    profile = (PROP_PROFILE or "").strip().lower()
+    if profile in BROAD_RESEARCH_PROFILES or PROP_ALLOW_ETF_PROXY_DATA:
+        return False
+    spec = INSTRUMENTS.get(instrument, {})
+    proxy_symbol = spec.get("twelvedata_symbol")
+    return bool(proxy_symbol and proxy_symbol != instrument)
 
 
 def _parse_candles(data: dict) -> list[Candle]:

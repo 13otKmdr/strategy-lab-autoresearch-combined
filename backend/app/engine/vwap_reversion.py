@@ -36,6 +36,7 @@ from app.engine.backtester import (
 from app.engine.compliance import check_compliance
 from app.engine.indicators import atr as calc_atr
 from app.engine.indicators import vwap as calc_vwap
+from app.engine.prop_risk_sizing import PropRiskSizingInput, futures_position_pnl, size_integer_micro_contracts
 from app.models.backtest import BacktestResult, Trade
 from app.models.market import Candle
 from app.models.strategy import StrategyDefinition
@@ -80,6 +81,7 @@ def run_vwap_backtest(
     initial_capital: float = INITIAL_CAPITAL,
     strategy_id: str = "",
     market_type: str = "futures",
+    symbol: str = "MYM",
 ) -> BacktestResult:
     """Run a VWAP mean-reversion backtest and return a BacktestResult."""
     n = len(candles)
@@ -157,13 +159,13 @@ def run_vwap_backtest(
                     _try_enter(
                         "long", candles, i, cur_close, cur_vwap, cur_atr,
                         stop_buffer_atr, tp_mode, risk_pct, equity,
-                        open_positions, strategy_id,
+                        open_positions, strategy_id, symbol,
                     )
                 elif take_short:
                     _try_enter(
                         "short", candles, i, cur_close, cur_vwap, cur_atr,
                         stop_buffer_atr, tp_mode, risk_pct, equity,
-                        open_positions, strategy_id,
+                        open_positions, strategy_id, symbol,
                     )
 
         equity_curve[i] = equity
@@ -173,12 +175,9 @@ def run_vwap_backtest(
     for pos in open_positions:
         is_short = pos["direction"] == "short"
         exit_price = candles[-1].close * (1 + SLIPPAGE_PCT if is_short else 1 - SLIPPAGE_PCT)
-        cost = _commission(exit_price * pos["size"])
-        gross_pnl = (
-            (pos["entry_price"] - exit_price) * pos["size"] if is_short
-            else (exit_price - pos["entry_price"]) * pos["size"]
-        )
-        net_pnl = gross_pnl - cost
+        cost = _commission(pos["size"])
+        gross_pnl = futures_position_pnl(pos.get("symbol", "MYM"), pos["entry_price"], exit_price, pos["size"], pos["direction"])
+        net_pnl = gross_pnl - pos.get("entry_cost", 0.0) - cost
         equity += net_pnl
         equity_curve[-1] = equity
         completed_trades.append(Trade(
@@ -212,6 +211,7 @@ def _try_enter(
     equity: float,
     open_positions: list[dict],
     strategy_id: str,
+    symbol: str = "MYM",
 ) -> None:
     is_short = side == "short"
 
@@ -235,11 +235,19 @@ def _try_enter(
     if stop_price <= 0:
         return
 
-    risk_usd = equity * (risk_pct / 100.0)
     risk_dist = abs(entry_price - stop_price)
-    size = risk_usd / risk_dist if risk_dist > 0 else 0
-    if size <= 0:
+    if risk_dist <= 0:
         return
+    sizing = size_integer_micro_contracts(PropRiskSizingInput(
+        symbol=symbol,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        risk_level=risk_pct,
+    ))
+    if sizing.contracts <= 0:
+        return
+    size = sizing.contracts
+    risk_usd = sizing.contracts * sizing.dollars_at_risk_per_contract
 
     # Take profit
     if tp_mode == "vwap":
@@ -257,7 +265,7 @@ def _try_enter(
     if not is_short and tp_price <= entry_price:
         return
 
-    cost = _commission(entry_price * size)
+    cost = _commission(size)
 
     open_positions.append({
         "entry_bar": i,
@@ -265,6 +273,8 @@ def _try_enter(
         "stop_price": stop_price,
         "tp_price": tp_price,
         "size": size,
+        "symbol": symbol,
+        "entry_cost": cost,
         "risk_usd": risk_usd,
         "direction": side,
         "entry_ts": candles[i].ts,
@@ -308,12 +318,9 @@ def _check_exit(
     if exit_price is None:
         return None
 
-    cost = _commission(exit_price * pos["size"])
-    gross_pnl = (
-        (pos["entry_price"] - exit_price) * pos["size"] if is_short
-        else (exit_price - pos["entry_price"]) * pos["size"]
-    )
-    net_pnl = gross_pnl - cost
+    cost = _commission(pos["size"])
+    gross_pnl = futures_position_pnl(pos.get("symbol", "MYM"), pos["entry_price"], exit_price, pos["size"], pos["direction"])
+    net_pnl = gross_pnl - pos.get("entry_cost", 0.0) - cost
 
     return Trade(
         entry_bar=pos["entry_bar"], exit_bar=i,

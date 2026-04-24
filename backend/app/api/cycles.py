@@ -14,7 +14,15 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from app.config import INITIAL_CAPITAL, IS_SPLIT, RISK_LEVELS, STRATEGIES_PER_ASSET
+from app.config import (
+    INITIAL_CAPITAL,
+    IS_SPLIT,
+    PROP_ALLOWED_SYMBOLS,
+    PROP_BLOCKED_SYMBOLS,
+    PROP_PROFILE,
+    RISK_LEVELS,
+    STRATEGIES_PER_ASSET,
+)
 from app.data import storage
 from app.data.mock_data import generate_mock_candles
 from app.data.twelvedata import fetch_2y_candles, fetch_candles
@@ -24,6 +32,7 @@ from app.engine.generator import generate_for_asset
 from app.engine.monte_carlo_eval import simulate_eval, TOPSTEP_50K
 from app.engine.orb import run_orb_backtest, orb_config_from_strategy
 from app.engine.portfolio import optimize_portfolio
+from app.engine.prop_profile import select_instruments
 from app.engine.ranker import rank_strategies
 from app.engine.scout import AssetRegime, scout_all_assets
 from app.engine.session_rotation import run_session_backtest, SessionRotationConfig
@@ -51,6 +60,14 @@ async def run_cycle():
 
     logger.info("Starting v2 cycle %s", cycle_id)
 
+    enabled_instruments = select_instruments(
+        tuple(INSTRUMENTS.keys()),
+        profile=PROP_PROFILE,
+        allowed_symbols=PROP_ALLOWED_SYMBOLS,
+        blocked_symbols=PROP_BLOCKED_SYMBOLS,
+    )
+    logger.info("Active prop profile %s enabled instruments: %s", PROP_PROFILE, ", ".join(enabled_instruments))
+
     # Phase 1: Scout all assets
     logger.info("Phase 1: Scouting all assets...")
     scout_start = time.time()
@@ -60,7 +77,7 @@ async def run_cycle():
         logger.warning("Scout failed: %s — using default regimes", e)
         regimes = {
             inst: AssetRegime(instrument=inst, symbol=inst, regime="ranging", direction_bias="neutral", strength=0.5)
-            for inst in INSTRUMENTS
+            for inst in enabled_instruments
         }
     logger.info("Scout complete in %.1fs", time.time() - scout_start)
 
@@ -71,7 +88,7 @@ async def run_cycle():
     total_tests = 0
     seed = int(time.time())
 
-    for instrument in INSTRUMENTS:
+    for instrument in enabled_instruments:
         asset_start = time.time()
         regime = regimes.get(instrument, AssetRegime(
             instrument=instrument, symbol=instrument, regime="ranging",
@@ -265,6 +282,7 @@ def _run_strategy_backtest(strat, candles, risk_pct, capital):
             initial_capital=capital,
             strategy_id=strat.strategy_id,
             market_type=strat.market_type,
+            symbol=strat.intended_asset_classes[0] if strat.intended_asset_classes else "MYM",
         )
 
     if strat.strategy_id.startswith("SESS-"):
@@ -274,6 +292,7 @@ def _run_strategy_backtest(strat, candles, risk_pct, capital):
         midday = entry_rules.get("midday", {})
         afternoon = entry_rules.get("afternoon", {})
         session_config = SessionRotationConfig(
+            symbol=strat.intended_asset_classes[0] if strat.intended_asset_classes else "MYM",
             morning_trigger=morning.get("trigger", "DC_UPPER_BREAK"),
             morning_filter=morning.get("filter", "ATR_EXPANDING"),
             midday_trigger=midday.get("trigger", "RSI_OVERSOLD"),

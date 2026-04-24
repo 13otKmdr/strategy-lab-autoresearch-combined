@@ -22,6 +22,7 @@ from app.config import (
 )
 from app.engine.compliance import check_compliance
 from app.engine.indicators import ema as _ema
+from app.engine.prop_risk_sizing import PropRiskSizingInput, futures_position_pnl, size_integer_micro_contracts
 from app.engine.signals import (
     CONFIRMATIONS, ENTRY_TRIGGERS, calc_stop_price, calc_take_profit_price,
     check_entry, compute_indicators, is_short_trigger,
@@ -123,6 +124,8 @@ SESSION_STRATEGY_MAP: dict[str, list[dict]] = {
 @dataclass
 class SessionRotationConfig:
     """Configuration for session-rotated backtesting."""
+    symbol: str = "MYM"
+
     # Strategy types per session
     morning_strategy_type: str = "breakout"
     midday_strategy_type: str = "mean_reversion"
@@ -266,15 +269,19 @@ def run_session_backtest(
             equity_curve[i] = equity
             continue
 
-        risk_usd = equity * (risk_pct / 100.0)
-        risk_dist = abs(entry_price - stop_price)
-        size = risk_usd / risk_dist if risk_dist > 0 else 0
-        if size <= 0:
+        sizing = size_integer_micro_contracts(PropRiskSizingInput(
+            symbol=config.symbol,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            risk_level=risk_pct,
+        ))
+        if sizing.contracts <= 0:
             equity_curve[i] = equity
             continue
+        size = sizing.contracts
+        risk_usd = sizing.contracts * sizing.dollars_at_risk_per_contract
 
-        cost = _commission(entry_price * size)
-        equity -= cost
+        cost = _commission(size)
 
         tp_price = calc_take_profit_price(tmp_strategy, entry_price, stop_price, short=short)
         trail_stop = None
@@ -290,6 +297,8 @@ def run_session_backtest(
             "tp_price": tp_price,
             "trailing_stop": trail_stop,
             "size": size,
+            "symbol": config.symbol,
+            "entry_cost": cost,
             "risk_usd": risk_usd,
             "regime": regime_arr[i],
             "entry_ts": candles[i].ts,
@@ -304,10 +313,9 @@ def run_session_backtest(
     for pos in open_positions:
         is_short = pos["direction"] == "short"
         exit_price = candles[-1].close * (1 + SLIPPAGE_PCT if is_short else 1 - SLIPPAGE_PCT)
-        cost = _commission(exit_price * pos["size"])
-        gross_pnl = ((pos["entry_price"] - exit_price) * pos["size"] if is_short
-                     else (exit_price - pos["entry_price"]) * pos["size"])
-        net_pnl = gross_pnl - cost
+        cost = _commission(pos["size"])
+        gross_pnl = futures_position_pnl(pos.get("symbol", "MYM"), pos["entry_price"], exit_price, pos["size"], pos["direction"])
+        net_pnl = gross_pnl - pos.get("entry_cost", 0.0) - cost
         equity += net_pnl
         equity_curve[-1] = equity
         completed_trades.append(Trade(
@@ -490,10 +498,9 @@ def _check_exit(pos, candles, i, config, equity):
     if exit_price is None:
         return None
 
-    cost = _commission(exit_price * pos["size"])
-    gross_pnl = ((pos["entry_price"] - exit_price) * pos["size"] if short
-                 else (exit_price - pos["entry_price"]) * pos["size"])
-    net_pnl = gross_pnl - cost
+    cost = _commission(pos["size"])
+    gross_pnl = futures_position_pnl(pos.get("symbol", "MYM"), pos["entry_price"], exit_price, pos["size"], pos["direction"])
+    net_pnl = gross_pnl - pos.get("entry_cost", 0.0) - cost
 
     return Trade(
         entry_bar=pos["entry_bar"], exit_bar=i,
@@ -508,8 +515,8 @@ def _check_exit(pos, candles, i, config, equity):
     )
 
 
-def _commission(trade_value: float) -> float:
-    return max(COMMISSION_FLAT, trade_value * COMMISSION_PCT)
+def _commission(contracts: float) -> float:
+    return COMMISSION_FLAT * abs(contracts)
 
 
 def _compute_regimes(ema200: np.ndarray, close: np.ndarray) -> list[str]:
