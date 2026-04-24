@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
+from app import config
 from app.config import (
     INITIAL_CAPITAL,
     IS_SPLIT,
@@ -22,9 +23,14 @@ from app.config import (
     PROP_PROFILE,
     RISK_LEVELS,
     STRATEGIES_PER_ASSET,
+    TOPSTEPX_API_KEY,
+    TOPSTEPX_BASE_URL,
+    TOPSTEPX_EMAIL,
 )
 from app.data import storage
+from app.data.contract_resolver import resolve_contract_id
 from app.data.mock_data import generate_mock_candles
+from app.data.projectx_market_data import ProjectXMarketDataProvider
 from app.data.twelvedata import fetch_2y_candles, fetch_candles
 from app.engine.backtester import run_backtest
 from app.engine.compliance import check_compliance
@@ -36,6 +42,7 @@ from app.engine.ranker import rank_strategies
 from app.engine.scout import AssetRegime, scout_all_assets
 from app.engine.session_rotation import run_session_backtest, SessionRotationConfig
 from app.engine.vwap_reversion import run_vwap_backtest
+from app.execution.projectx_client import ProjectXClient
 from app.models.market import Candle, INSTRUMENTS
 from app.models.ranking import AssetResult, CycleSummary
 
@@ -57,7 +64,7 @@ async def run_cycle():
     timestamp = datetime.now(timezone.utc).isoformat()
     start_time = time.time()
 
-    logger.info("Starting v2 cycle %s", cycle_id)
+    logger.info("Starting v2 cycle %s (data_source=%s)", cycle_id, config.DATA_SOURCE)
 
     enabled_instruments = select_instruments(
         tuple(INSTRUMENTS.keys()),
@@ -66,6 +73,17 @@ async def run_cycle():
         blocked_symbols=PROP_BLOCKED_SYMBOLS,
     )
     logger.info("Active prop profile %s enabled instruments: %s", PROP_PROFILE, ", ".join(enabled_instruments))
+
+    # Pre-initialize ProjectX client if using real futures data
+    px_provider = None
+    if config.DATA_SOURCE == "projectx":
+        px_client = ProjectXClient(
+            base_url=TOPSTEPX_BASE_URL,
+            email=TOPSTEPX_EMAIL,
+            api_key=TOPSTEPX_API_KEY,
+        )
+        px_provider = ProjectXMarketDataProvider(px_client)
+        logger.info("ProjectX market data provider initialized")
 
     # Phase 1: Scout all assets
     logger.info("Phase 1: Scouting all assets...")
@@ -100,13 +118,23 @@ async def run_cycle():
         # Fetch candle data (2 years with cache, fall back to shorter window or mock)
         candles: list[Candle] = []
         try:
-            candles = await fetch_2y_candles(instrument, "15min", use_cache=True)
+            if config.DATA_SOURCE == "projectx" and px_provider is not None:
+                contract_id = resolve_contract_id(instrument)
+                candles = await px_provider.fetch_2y_candles(contract_id, "15min", use_cache=True)
+                logger.info("Fetched real futures data for %s via ProjectX (%s): %d candles",
+                            instrument, contract_id, len(candles))
+            else:
+                candles = await fetch_2y_candles(instrument, "15min", use_cache=True)
         except Exception as e:
             logger.warning("2y fetch failed for %s: %s", instrument, e)
 
         if not candles:
             try:
-                candles = await fetch_candles(instrument, "15min", 5000)
+                if config.DATA_SOURCE == "projectx" and px_provider is not None:
+                    contract_id = resolve_contract_id(instrument)
+                    candles = await px_provider.fetch_candles(contract_id, "15min", 5000)
+                else:
+                    candles = await fetch_candles(instrument, "15min", 5000)
             except Exception:
                 pass
 
