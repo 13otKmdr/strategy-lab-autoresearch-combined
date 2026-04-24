@@ -29,7 +29,6 @@ from app.data.twelvedata import fetch_2y_candles, fetch_candles
 from app.engine.backtester import run_backtest
 from app.engine.compliance import check_compliance
 from app.engine.generator import generate_for_asset
-from app.engine.monte_carlo_eval import simulate_eval, TOPSTEP_50K
 from app.engine.orb import run_orb_backtest, orb_config_from_strategy
 from app.engine.portfolio import optimize_portfolio
 from app.engine.prop_profile import select_instruments
@@ -165,18 +164,9 @@ async def run_cycle():
         # Cache results for cross-asset portfolio optimization
         all_results_cache.update(results)
 
-        # Rank strategies for this asset
+        # Rank strategies for this asset (includes deterministic challenge sim
+        # and Monte Carlo pass probability on every strategy)
         ranked = rank_strategies(strategies, results)
-
-        # Monte Carlo evaluation on top 10 strategies
-        for r in ranked[:10]:
-            result_025 = results[r.strategy_id].get(0.25) or results[r.strategy_id].get(0.5)
-            if result_025 and result_025.total_trades >= 10:
-                try:
-                    eval_result = simulate_eval(result_025, TOPSTEP_50K, n_sims=500)
-                    r.eval_pass_rate = eval_result.pass_rate
-                except Exception as exc:
-                    logger.warning("Monte Carlo eval failed for %s: %s", r.strategy_id, exc)
 
         for r in ranked:
             storage.save_ranking(r.strategy_id, cycle_id, r.rank, r.to_dict())
