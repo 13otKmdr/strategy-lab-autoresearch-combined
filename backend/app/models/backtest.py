@@ -33,7 +33,7 @@ class SidePerformance:
 @dataclass
 class BacktestConfig:
     strategy_id: str
-    risk_pct: float             # 0.25 or 0.5
+    risk_pct: float             # Prop profile: DRB multiple (0.25 = 25% of DRB); legacy name kept for API compatibility
     initial_capital: float      # 50000
     instrument: str             # "MES", "MNQ", etc.
     timeframe: str              # "15min"

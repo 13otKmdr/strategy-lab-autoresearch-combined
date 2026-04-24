@@ -2,7 +2,9 @@
 Bar-by-bar backtesting simulation engine for futures day trading.
 
 Adapted from agent-network/backtesting/engine.py.
-Tests each strategy at specified risk levels (0.25%, 0.5%).
+Tests each strategy at configured prop risk levels. Under the Prop Done Right
+profile, risk levels are Daily Risk Budget multiples (0.25 = 25% of DRB),
+not percentages of nominal account equity.
 """
 from __future__ import annotations
 
@@ -21,6 +23,12 @@ from app.engine.signals import (
     compute_indicators, is_short_trigger,
 )
 from app.engine.indicators import ema as _ema
+from app.engine.prop_risk_sizing import (
+    PropRiskSizingInput,
+    futures_position_pnl,
+    infer_symbol_from_strategy,
+    size_integer_micro_contracts,
+)
 
 
 def run_backtest(
@@ -122,6 +130,7 @@ def _simulate(
     short = is_short_trigger(trigger_name)
     direction = "short" if short else "long"
 
+    symbol = infer_symbol_from_strategy(strategy)
     close_arr = np.array([c.close for c in candles])
     regime_arr = _compute_regimes(indicators["ema200"], close_arr)
 
@@ -160,15 +169,19 @@ def _simulate(
                 equity_curve[i] = equity
                 continue
 
-            risk_usd = equity * (risk_pct / 100.0)
-            risk_dist = abs(entry_price - stop_price)
-            size = risk_usd / risk_dist if risk_dist > 0 else 0
-            if size <= 0:
+            sizing = size_integer_micro_contracts(PropRiskSizingInput(
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                risk_level=risk_pct,
+            ))
+            if sizing.contracts <= 0:
                 equity_curve[i] = equity
                 continue
+            size = sizing.contracts
+            risk_usd = sizing.contracts * sizing.dollars_at_risk_per_contract
 
-            cost = _commission(entry_price * size)
-            equity -= cost
+            cost = _commission(size)
 
             tp_price = calc_take_profit_price(strategy, entry_price, stop_price, short=short)
             trail_stop = None
@@ -184,6 +197,8 @@ def _simulate(
                 "tp_price": tp_price,
                 "trailing_stop": trail_stop,
                 "size": size,
+                "symbol": symbol,
+                "entry_cost": cost,
                 "risk_usd": risk_usd,
                 "regime": regime_arr[i],
                 "entry_ts": candles[i].ts,
@@ -196,10 +211,9 @@ def _simulate(
     for pos in open_positions:
         pos_short = pos.get("direction") == "short"
         exit_price = candles[-1].close * (1 + SLIPPAGE_PCT if pos_short else 1 - SLIPPAGE_PCT)
-        cost = _commission(exit_price * pos["size"])
-        gross_pnl = ((pos["entry_price"] - exit_price) * pos["size"] if pos_short
-                     else (exit_price - pos["entry_price"]) * pos["size"])
-        net_pnl = gross_pnl - cost
+        cost = _commission(pos["size"])
+        gross_pnl = futures_position_pnl(pos.get("symbol", "MYM"), pos["entry_price"], exit_price, pos["size"], pos.get("direction", "long"))
+        net_pnl = gross_pnl - pos.get("entry_cost", 0.0) - cost
         equity += net_pnl
         equity_curve[-1] = equity
         completed_trades.append(Trade(
@@ -248,10 +262,9 @@ def _check_exit(pos, candles, indicators, i, time_exit_bars, trailing_atr_mult, 
     if exit_price is None:
         return None
 
-    cost = _commission(exit_price * pos["size"])
-    gross_pnl = ((pos["entry_price"] - exit_price) * pos["size"] if short
-                 else (exit_price - pos["entry_price"]) * pos["size"])
-    net_pnl = gross_pnl - cost
+    cost = _commission(pos["size"])
+    gross_pnl = futures_position_pnl(pos.get("symbol", "MYM"), pos["entry_price"], exit_price, pos["size"], pos.get("direction", "long"))
+    net_pnl = gross_pnl - pos.get("entry_cost", 0.0) - cost
 
     return Trade(
         entry_bar=pos["entry_bar"], exit_bar=i,
@@ -266,8 +279,9 @@ def _check_exit(pos, candles, indicators, i, time_exit_bars, trailing_atr_mult, 
     )
 
 
-def _commission(trade_value: float) -> float:
-    return max(COMMISSION_FLAT, trade_value * COMMISSION_PCT)
+def _commission(contracts: float) -> float:
+    """Per-side futures commission/fees estimate, charged per contract."""
+    return COMMISSION_FLAT * abs(contracts)
 
 
 def _compute_regimes(ema200: np.ndarray, close: np.ndarray) -> list[str]:

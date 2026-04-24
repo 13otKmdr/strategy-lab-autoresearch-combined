@@ -17,11 +17,16 @@ import math
 import random
 from typing import Any
 
+import logging
+
 from app.engine.scout import AssetRegime
 from app.engine.orb import generate_orb_strategies
 from app.engine.vwap_reversion import generate_vwap_strategies
 from app.engine.session_rotation import generate_session_strategies
+from app.engine.topstep_compliance import validate_strategy_batch
 from app.models.strategy import StrategyBatch, StrategyDefinition
+
+logger = logging.getLogger(__name__)
 
 # ── Regime-based type weights ────────────────────────────────────────────────
 
@@ -398,7 +403,16 @@ def generate_for_asset(
     strategies.extend(generate_vwap_strategies(instrument, n=vwap_count))
     strategies.extend(generate_session_strategies(instrument, n=session_count))
 
-    return strategies
+    # ── Topstep compliance filter ───────────────────────────────────────────
+    pre_filter_count = len(strategies)
+    compliance_result = validate_strategy_batch(strategies)
+    filtered_count = pre_filter_count - len(compliance_result.passed)
+    if filtered_count > 0:
+        logger.info(
+            "Topstep compliance: filtered %d/%d strategies for %s (%d passed)",
+            filtered_count, pre_filter_count, instrument, len(compliance_result.passed),
+        )
+    return compliance_result.passed
 
 
 # Legacy function for backward compat

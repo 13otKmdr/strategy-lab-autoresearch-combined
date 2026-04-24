@@ -39,6 +39,16 @@ class RankedStrategy:
     # Monte Carlo eval
     eval_pass_rate: float = 0.0
 
+    # Prop challenge path simulation (prop_challenge_sim)
+    challenge_outcome: str = "timeout"          # "pass" | "fail_mll" | "fail_consistency" | "timeout"
+    challenge_total_profit: float = 0.0
+    challenge_days_traded: int = 0
+    challenge_best_day_profit: float = 0.0
+    challenge_consistency_passed: bool = False
+    challenge_mll_breached: bool = False
+    challenge_trades_taken: int = 0
+    challenge_trades_skipped: int = 0
+
     # Analysis
     strengths: list[str] = field(default_factory=list)
     weaknesses: list[str] = field(default_factory=list)
@@ -70,6 +80,14 @@ class RankedStrategy:
             "composite_score": round(self.composite_score, 2),
             "overall_compliance": self.overall_compliance,
             "eval_pass_rate": round(self.eval_pass_rate, 4),
+            "challenge_outcome": self.challenge_outcome,
+            "challenge_total_profit": round(self.challenge_total_profit, 2),
+            "challenge_days_traded": self.challenge_days_traded,
+            "challenge_best_day_profit": round(self.challenge_best_day_profit, 2),
+            "challenge_consistency_passed": self.challenge_consistency_passed,
+            "challenge_mll_breached": self.challenge_mll_breached,
+            "challenge_trades_taken": self.challenge_trades_taken,
+            "challenge_trades_skipped": self.challenge_trades_skipped,
             "strengths": self.strengths,
             "weaknesses": self.weaknesses,
         }

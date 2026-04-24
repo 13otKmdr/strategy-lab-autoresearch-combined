@@ -14,20 +14,36 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from app.config import INITIAL_CAPITAL, IS_SPLIT, RISK_LEVELS, STRATEGIES_PER_ASSET
+from app import config
+from app.config import (
+    INITIAL_CAPITAL,
+    IS_SPLIT,
+    PROP_ALLOWED_SYMBOLS,
+    PROP_BLOCKED_SYMBOLS,
+    PROP_PROFILE,
+    RISK_LEVELS,
+    STRATEGIES_PER_ASSET,
+    TOPSTEPX_API_KEY,
+    TOPSTEPX_BASE_URL,
+    TOPSTEPX_EMAIL,
+)
 from app.data import storage
+from app.data.contract_resolver import resolve_contract_id
 from app.data.mock_data import generate_mock_candles
+from app.data.projectx_market_data import ProjectXMarketDataProvider
 from app.data.twelvedata import fetch_2y_candles, fetch_candles
 from app.engine.backtester import run_backtest
 from app.engine.compliance import check_compliance
 from app.engine.generator import generate_for_asset
-from app.engine.monte_carlo_eval import simulate_eval, TOPSTEP_50K
 from app.engine.orb import run_orb_backtest, orb_config_from_strategy
+from app.engine.topstep_compliance import validate_strategy_batch
 from app.engine.portfolio import optimize_portfolio
+from app.engine.prop_profile import select_instruments
 from app.engine.ranker import rank_strategies
 from app.engine.scout import AssetRegime, scout_all_assets
 from app.engine.session_rotation import run_session_backtest, SessionRotationConfig
 from app.engine.vwap_reversion import run_vwap_backtest
+from app.execution.projectx_client import ProjectXClient
 from app.models.market import Candle, INSTRUMENTS
 from app.models.ranking import AssetResult, CycleSummary
 
@@ -49,7 +65,26 @@ async def run_cycle():
     timestamp = datetime.now(timezone.utc).isoformat()
     start_time = time.time()
 
-    logger.info("Starting v2 cycle %s", cycle_id)
+    logger.info("Starting v2 cycle %s (data_source=%s)", cycle_id, config.DATA_SOURCE)
+
+    enabled_instruments = select_instruments(
+        tuple(INSTRUMENTS.keys()),
+        profile=PROP_PROFILE,
+        allowed_symbols=PROP_ALLOWED_SYMBOLS,
+        blocked_symbols=PROP_BLOCKED_SYMBOLS,
+    )
+    logger.info("Active prop profile %s enabled instruments: %s", PROP_PROFILE, ", ".join(enabled_instruments))
+
+    # Pre-initialize ProjectX client if using real futures data
+    px_provider = None
+    if config.DATA_SOURCE == "projectx":
+        px_client = ProjectXClient(
+            base_url=TOPSTEPX_BASE_URL,
+            email=TOPSTEPX_EMAIL,
+            api_key=TOPSTEPX_API_KEY,
+        )
+        px_provider = ProjectXMarketDataProvider(px_client)
+        logger.info("ProjectX market data provider initialized")
 
     # Phase 1: Scout all assets
     logger.info("Phase 1: Scouting all assets...")
@@ -60,7 +95,7 @@ async def run_cycle():
         logger.warning("Scout failed: %s — using default regimes", e)
         regimes = {
             inst: AssetRegime(instrument=inst, symbol=inst, regime="ranging", direction_bias="neutral", strength=0.5)
-            for inst in INSTRUMENTS
+            for inst in enabled_instruments
         }
     logger.info("Scout complete in %.1fs", time.time() - scout_start)
 
@@ -71,7 +106,7 @@ async def run_cycle():
     total_tests = 0
     seed = int(time.time())
 
-    for instrument in INSTRUMENTS:
+    for instrument in enabled_instruments:
         asset_start = time.time()
         regime = regimes.get(instrument, AssetRegime(
             instrument=instrument, symbol=instrument, regime="ranging",
@@ -84,13 +119,23 @@ async def run_cycle():
         # Fetch candle data (2 years with cache, fall back to shorter window or mock)
         candles: list[Candle] = []
         try:
-            candles = await fetch_2y_candles(instrument, "15min", use_cache=True)
+            if config.DATA_SOURCE == "projectx" and px_provider is not None:
+                contract_id = resolve_contract_id(instrument)
+                candles = await px_provider.fetch_2y_candles(contract_id, "15min", use_cache=True)
+                logger.info("Fetched real futures data for %s via ProjectX (%s): %d candles",
+                            instrument, contract_id, len(candles))
+            else:
+                candles = await fetch_2y_candles(instrument, "15min", use_cache=True)
         except Exception as e:
             logger.warning("2y fetch failed for %s: %s", instrument, e)
 
         if not candles:
             try:
-                candles = await fetch_candles(instrument, "15min", 5000)
+                if config.DATA_SOURCE == "projectx" and px_provider is not None:
+                    contract_id = resolve_contract_id(instrument)
+                    candles = await px_provider.fetch_candles(contract_id, "15min", 5000)
+                else:
+                    candles = await fetch_candles(instrument, "15min", 5000)
             except Exception:
                 pass
 
@@ -107,6 +152,17 @@ async def run_cycle():
         # Generate strategies
         strategies = generate_for_asset(instrument, regime, seed + hash(instrument), STRATEGIES_PER_ASSET)
         logger.info("  Generated %d strategies for %s", len(strategies), instrument)
+
+        # Apply Topstep compliance filter at cycle level
+        ts_result = validate_strategy_batch(strategies)
+        pre_ts_count = len(strategies)
+        strategies = ts_result.passed
+        ts_filtered = pre_ts_count - len(strategies)
+        if ts_filtered > 0:
+            logger.info(
+                "  Topstep compliance (cycle): filtered %d/%d strategies for %s — %d passed",
+                ts_filtered, pre_ts_count, instrument, len(strategies),
+            )
 
         # Backtest each strategy at both risk levels (IS + OOS)
         results: dict[str, dict[float, any]] = {}
@@ -148,18 +204,9 @@ async def run_cycle():
         # Cache results for cross-asset portfolio optimization
         all_results_cache.update(results)
 
-        # Rank strategies for this asset
+        # Rank strategies for this asset (includes deterministic challenge sim
+        # and Monte Carlo pass probability on every strategy)
         ranked = rank_strategies(strategies, results)
-
-        # Monte Carlo evaluation on top 10 strategies
-        for r in ranked[:10]:
-            result_025 = results[r.strategy_id].get(0.25) or results[r.strategy_id].get(0.5)
-            if result_025 and result_025.total_trades >= 10:
-                try:
-                    eval_result = simulate_eval(result_025, TOPSTEP_50K, n_sims=500)
-                    r.eval_pass_rate = eval_result.pass_rate
-                except Exception as exc:
-                    logger.warning("Monte Carlo eval failed for %s: %s", r.strategy_id, exc)
 
         for r in ranked:
             storage.save_ranking(r.strategy_id, cycle_id, r.rank, r.to_dict())
@@ -265,6 +312,7 @@ def _run_strategy_backtest(strat, candles, risk_pct, capital):
             initial_capital=capital,
             strategy_id=strat.strategy_id,
             market_type=strat.market_type,
+            symbol=strat.intended_asset_classes[0] if strat.intended_asset_classes else "MYM",
         )
 
     if strat.strategy_id.startswith("SESS-"):
@@ -274,6 +322,7 @@ def _run_strategy_backtest(strat, candles, risk_pct, capital):
         midday = entry_rules.get("midday", {})
         afternoon = entry_rules.get("afternoon", {})
         session_config = SessionRotationConfig(
+            symbol=strat.intended_asset_classes[0] if strat.intended_asset_classes else "MYM",
             morning_trigger=morning.get("trigger", "DC_UPPER_BREAK"),
             morning_filter=morning.get("filter", "ATR_EXPANDING"),
             midday_trigger=midday.get("trigger", "RSI_OVERSOLD"),

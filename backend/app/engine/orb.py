@@ -17,6 +17,7 @@ from itertools import product
 import numpy as np
 
 from app.config import COMMISSION_FLAT, COMMISSION_PCT, SLIPPAGE_PCT, WARMUP_BARS
+from app.engine.prop_risk_sizing import PropRiskSizingInput, futures_position_pnl, size_integer_micro_contracts
 from app.models.backtest import BacktestResult, Trade
 from app.models.market import Candle
 from app.models.strategy import StrategyDefinition
@@ -95,8 +96,8 @@ def _atr(candles: list[Candle], period: int = 14) -> np.ndarray:
 # Commission helper (mirrors backtester._commission)
 # ---------------------------------------------------------------------------
 
-def _commission(trade_value: float) -> float:
-    return max(COMMISSION_FLAT, trade_value * COMMISSION_PCT)
+def _commission(contracts: float) -> float:
+    return COMMISSION_FLAT * abs(contracts)
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@ def run_orb_backtest(
     time_exit_bars = strategy_config.get("time_exit_bars", 16)
     session_start_hour = strategy_config.get("session_start_hour", 9)
     session_start_minute = strategy_config.get("session_start_minute", 30)
+    symbol = strategy_config.get("symbol") or strategy_config.get("instrument") or "MYM"
 
     n = len(candles)
     if n < WARMUP_BARS + range_bars + 2:
@@ -196,13 +198,18 @@ def run_orb_backtest(
                     continue
                 tp_price = entry_price + risk_dist * tp_r_multiple
 
-                risk_usd = equity * (risk_pct / 100.0)
-                size = risk_usd / risk_dist
-                if size <= 0:
+                sizing = size_integer_micro_contracts(PropRiskSizingInput(
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    stop_price=stop_price,
+                    risk_level=risk_pct,
+                ))
+                if sizing.contracts <= 0:
                     equity_curve[i] = equity
                     continue
-                cost = _commission(entry_price * size)
-                equity -= cost
+                size = sizing.contracts
+                risk_usd = sizing.contracts * sizing.dollars_at_risk_per_contract
+                cost = _commission(size)
 
                 open_position = {
                     "entry_bar": i,
@@ -210,6 +217,8 @@ def run_orb_backtest(
                     "stop_price": stop_price,
                     "tp_price": tp_price,
                     "size": size,
+                    "symbol": symbol,
+                    "entry_cost": cost,
                     "risk_usd": risk_usd,
                     "direction": "long",
                     "entry_ts": candles[i].ts,
@@ -226,13 +235,18 @@ def run_orb_backtest(
                     continue
                 tp_price = entry_price - risk_dist * tp_r_multiple
 
-                risk_usd = equity * (risk_pct / 100.0)
-                size = risk_usd / risk_dist
-                if size <= 0:
+                sizing = size_integer_micro_contracts(PropRiskSizingInput(
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    stop_price=stop_price,
+                    risk_level=risk_pct,
+                ))
+                if sizing.contracts <= 0:
                     equity_curve[i] = equity
                     continue
-                cost = _commission(entry_price * size)
-                equity -= cost
+                size = sizing.contracts
+                risk_usd = sizing.contracts * sizing.dollars_at_risk_per_contract
+                cost = _commission(size)
 
                 open_position = {
                     "entry_bar": i,
@@ -240,6 +254,8 @@ def run_orb_backtest(
                     "stop_price": stop_price,
                     "tp_price": tp_price,
                     "size": size,
+                    "symbol": symbol,
+                    "entry_cost": cost,
                     "risk_usd": risk_usd,
                     "direction": "short",
                     "entry_ts": candles[i].ts,
@@ -252,13 +268,15 @@ def run_orb_backtest(
     if open_position is not None:
         is_short = open_position["direction"] == "short"
         exit_price = candles[-1].close * (1 + SLIPPAGE_PCT if is_short else 1 - SLIPPAGE_PCT)
-        cost = _commission(exit_price * open_position["size"])
-        gross_pnl = (
-            (open_position["entry_price"] - exit_price) * open_position["size"]
-            if is_short
-            else (exit_price - open_position["entry_price"]) * open_position["size"]
+        cost = _commission(open_position["size"])
+        gross_pnl = futures_position_pnl(
+            open_position.get("symbol", "MYM"),
+            open_position["entry_price"],
+            exit_price,
+            open_position["size"],
+            open_position["direction"],
         )
-        net_pnl = gross_pnl - cost
+        net_pnl = gross_pnl - open_position.get("entry_cost", 0.0) - cost
         equity += net_pnl
         equity_curve[-1] = equity
         completed_trades.append(Trade(
@@ -316,13 +334,9 @@ def _check_orb_exit(
     if exit_price is None:
         return None
 
-    cost = _commission(exit_price * pos["size"])
-    gross_pnl = (
-        (pos["entry_price"] - exit_price) * pos["size"]
-        if is_short
-        else (exit_price - pos["entry_price"]) * pos["size"]
-    )
-    net_pnl = gross_pnl - cost
+    cost = _commission(pos["size"])
+    gross_pnl = futures_position_pnl(pos.get("symbol", "MYM"), pos["entry_price"], exit_price, pos["size"], pos["direction"])
+    net_pnl = gross_pnl - pos.get("entry_cost", 0.0) - cost
 
     return Trade(
         entry_bar=pos["entry_bar"],
@@ -431,6 +445,7 @@ def orb_config_from_strategy(strategy: StrategyDefinition) -> dict:
     orb = strategy.entry.get("orb_config", {})
     return {
         "strategy_id": strategy.strategy_id,
+        "symbol": strategy.intended_asset_classes[0] if strategy.intended_asset_classes else "MYM",
         "range_bars": orb.get("range_bars", 2),
         "direction": orb.get("direction", "long"),
         "stop_atr_buffer": orb.get("stop_atr_buffer", 0.25),

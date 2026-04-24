@@ -1,6 +1,13 @@
 """
 Cross-Account Hedge Simulator v2 (Bug-fixed + Scaling Model).
 
+**WARNING: RESEARCH-ONLY MODULE**
+This module models cross-account hedging (opposite positions on futures + CFD
+accounts), which is explicitly prohibited by Topstep and most prop firm rules.
+It must NEVER be used during live trading or any real-money execution context.
+Use is restricted to backtesting, Monte Carlo research, and academic analysis
+of hedging dynamics.
+
 FIXES from quant review:
 - Sticky DD: once an account hits DD limit, it's permanently blown (no recovery)
 - Frozen P&L: blown account's position size set to 0, no phantom P&L
@@ -12,8 +19,30 @@ ADDITIONS:
 """
 from __future__ import annotations
 
+import os
 import math
 from dataclasses import dataclass, field
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RESEARCH-ONLY GUARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+RESEARCH_ONLY: bool = True
+"""Module constant indicating this module is for research purposes only."""
+
+
+def assert_research_only() -> None:
+    """Raise RuntimeError if called outside a research execution context.
+
+    Checks the ``TRADING_MODE`` environment variable.  When it is set to
+    anything other than ``"research"`` (the default), a ``RuntimeError`` is
+    raised to prevent accidental use in live or paper-trading environments.
+    """
+    mode = os.environ.get("TRADING_MODE", "research")
+    if mode != "research":
+        raise RuntimeError(
+            "Hedge simulator is RESEARCH_ONLY and must not be used in live trading"
+        )
 
 import numpy as np
 

@@ -21,6 +21,8 @@ from app.models.backtest import BacktestResult
 from app.models.ranking import RankedStrategy
 from app.models.strategy import StrategyDefinition
 from app.engine.metrics import analyze_strengths_weaknesses
+from app.engine.prop_challenge_sim import simulate_prop_challenge
+from app.engine.monte_carlo_challenge import mc_challenge_pass_rate
 
 
 def rank_strategies(
@@ -49,6 +51,15 @@ def rank_strategies(
             continue
 
         score = _compute_composite_score(r025, r050)
+
+        # Run prop challenge path simulation on the primary risk level's trades
+        challenge_result = simulate_prop_challenge(r025.trades)
+        score = _apply_challenge_adjustment(score, challenge_result.outcome)
+
+        # Run Monte Carlo challenge pass probability (200 resampled paths)
+        mc_result = mc_challenge_pass_rate(r025.trades, n_sims=200)
+        score = _apply_mc_pass_rate_adjustment(score, mc_result.pass_rate)
+
         strengths, weaknesses = analyze_strengths_weaknesses(r025, r050)
 
         overall_compliance = "compliant"
@@ -80,6 +91,15 @@ def rank_strategies(
             compliance_status_050=r050.compliance_status,
             composite_score=score,
             overall_compliance=overall_compliance,
+            eval_pass_rate=mc_result.pass_rate,
+            challenge_outcome=challenge_result.outcome,
+            challenge_total_profit=challenge_result.total_profit,
+            challenge_days_traded=challenge_result.days_traded,
+            challenge_best_day_profit=challenge_result.best_day_profit,
+            challenge_consistency_passed=challenge_result.consistency_passed,
+            challenge_mll_breached=challenge_result.mll_breached,
+            challenge_trades_taken=challenge_result.trades_taken,
+            challenge_trades_skipped=challenge_result.trades_skipped,
             strengths=strengths,
             weaknesses=weaknesses,
         ))
@@ -188,3 +208,45 @@ def _compute_composite_score(r025: BacktestResult, r050: BacktestResult) -> floa
             break
 
     return max(0, raw_score - penalties)
+
+
+def _apply_challenge_adjustment(score: float, challenge_outcome: str) -> float:
+    """Adjust composite score based on prop challenge simulation outcome.
+
+    - ``pass``: +20 bonus — strategy demonstrably survives the Topstep 50K path
+    - ``fail_mll``: −25 penalty — strategy blows the Maximum Loss Limit
+    - ``fail_consistency``: −15 penalty — one-day concentration too high
+    - ``timeout``: no adjustment — trade list ended without resolution
+    """
+    if challenge_outcome == "pass":
+        return score + 20
+    if challenge_outcome == "fail_mll":
+        return max(0, score - 25)
+    if challenge_outcome == "fail_consistency":
+        return max(0, score - 15)
+    # timeout — neutral
+    return score
+
+
+def _apply_mc_pass_rate_adjustment(score: float, pass_rate: float) -> float:
+    """Adjust composite score based on Monte Carlo challenge pass probability.
+
+    The MC pass rate is the probability that resampled trade sequences from
+    this strategy would actually pass the Topstep 50K challenge. This is a
+    more robust signal than the single deterministic path.
+
+    Scoring:
+    - pass_rate >= 0.80: +15 bonus — high confidence the strategy passes
+    - pass_rate >= 0.50: +5 bonus — decent probability
+    - pass_rate < 0.20: -10 penalty — likely to fail in practice
+    - pass_rate = 0.0: -15 penalty — never passes in simulation
+    """
+    if pass_rate >= 0.80:
+        return score + 15
+    if pass_rate >= 0.50:
+        return score + 5
+    if pass_rate > 0.0:
+        # Low but non-zero — small penalty
+        return max(0, score - 5)
+    # pass_rate == 0.0
+    return max(0, score - 15)
