@@ -124,6 +124,10 @@ async def fetch_candles(
     if not spec:
         raise ValueError(f"Unknown instrument: {instrument}")
 
+    if _prop_profile_blocks_proxy_data(instrument):
+        logger.warning("Blocked ETF proxy data for %s under challenge profile", instrument)
+        return []
+
     symbol = spec["twelvedata_symbol"]
 
     if not TWELVEDATA_API_KEY:
@@ -164,6 +168,10 @@ async def fetch_candles_range(
     spec = INSTRUMENTS.get(instrument)
     if not spec:
         raise ValueError(f"Unknown instrument: {instrument}")
+
+    if _prop_profile_blocks_proxy_data(instrument):
+        logger.warning("Blocked ETF proxy data for %s under challenge profile", instrument)
+        return []
 
     symbol = spec["twelvedata_symbol"]
 
