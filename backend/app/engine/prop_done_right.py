@@ -123,6 +123,46 @@ def evaluate_trade_gate(gate_input: TradeGateInput, config: PropDoneRightConfig 
     return TradeGateDecision(True, "allow", "trade passes Prop Done Right gate")
 
 
+def check_anti_hedging(current_position_side: str, proposed_side: str) -> TradeGateDecision:
+    """Block opening opposing positions on the same instrument (anti-hedging guard).
+
+    Parameters
+    ----------
+    current_position_side : str
+        One of 'long', 'short', or 'flat'.
+    proposed_side : str
+        One of 'long' or 'short'.
+
+    Returns
+    -------
+    TradeGateDecision
+        Allowed when flat or same direction; blocked when an opposing
+        position already exists.
+    """
+    current = current_position_side.lower()
+    proposed = proposed_side.lower()
+
+    if current == "flat":
+        return TradeGateDecision(True, "allow", "no existing position; trade permitted")
+
+    if current == "long" and proposed == "short":
+        return TradeGateDecision(
+            False,
+            "block_entry",
+            "anti-hedging: long position already open, short entry blocked",
+        )
+
+    if current == "short" and proposed == "long":
+        return TradeGateDecision(
+            False,
+            "block_entry",
+            "anti-hedging: short position already open, long entry blocked",
+        )
+
+    # Same direction or no conflict — allow
+    return TradeGateDecision(True, "allow", "trade direction matches existing position")
+
+
 def mym_micro_contracts_for_risk(risk_budget: float, stop_ticks: int, round_turn_fees: float = 0.0) -> int:
     """Calculate integer MYM micro contracts for a stop distance and risk budget.
 

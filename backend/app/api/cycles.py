@@ -36,6 +36,7 @@ from app.engine.backtester import run_backtest
 from app.engine.compliance import check_compliance
 from app.engine.generator import generate_for_asset
 from app.engine.orb import run_orb_backtest, orb_config_from_strategy
+from app.engine.topstep_compliance import validate_strategy_batch
 from app.engine.portfolio import optimize_portfolio
 from app.engine.prop_profile import select_instruments
 from app.engine.ranker import rank_strategies
@@ -151,6 +152,17 @@ async def run_cycle():
         # Generate strategies
         strategies = generate_for_asset(instrument, regime, seed + hash(instrument), STRATEGIES_PER_ASSET)
         logger.info("  Generated %d strategies for %s", len(strategies), instrument)
+
+        # Apply Topstep compliance filter at cycle level
+        ts_result = validate_strategy_batch(strategies)
+        pre_ts_count = len(strategies)
+        strategies = ts_result.passed
+        ts_filtered = pre_ts_count - len(strategies)
+        if ts_filtered > 0:
+            logger.info(
+                "  Topstep compliance (cycle): filtered %d/%d strategies for %s — %d passed",
+                ts_filtered, pre_ts_count, instrument, len(strategies),
+            )
 
         # Backtest each strategy at both risk levels (IS + OOS)
         results: dict[str, dict[float, any]] = {}
