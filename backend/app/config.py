@@ -46,3 +46,19 @@ SLIPPAGE_PCT: float = 0.001     # 0.1% per side
 COMMISSION_FLAT: float = 1.00   # $1 minimum
 COMMISSION_PCT: float = 0.0005  # 0.05% of trade value
 WARMUP_BARS: int = 200          # bars needed for longest indicator
+
+# ProjectX / TopstepX API
+TOPSTEPX_BASE_URL: str = os.getenv("TOPSTEPX_BASE_URL", "https://api.topstepx.com")
+TOPSTEPX_EMAIL: str = os.getenv("TOPSTEPX_EMAIL", "")
+TOPSTEPX_API_KEY: str = os.getenv("TOPSTEPX_API_KEY", "")
+TOPSTEPX_ACCOUNT_ID: int = int(os.getenv("TOPSTEPX_ACCOUNT_ID", "0"))
+
+# Data source: "projectx" for real futures data, "twelvedata" for ETF proxies
+DATA_SOURCE: str = os.getenv("DATA_SOURCE", "projectx")
+
+# Live trading safety gates
+LIVE_FEATURE_FLAG: bool = os.getenv("LIVE_FEATURE_FLAG", "false").lower() in {"1", "true", "yes", "on"}
+LIVE_ARMING_TOKEN: str = os.getenv("LIVE_ARMING_TOKEN", "")
+LIVE_ALLOWLISTED_ACCOUNTS: set[str] = set(
+    s.strip() for s in os.getenv("LIVE_ALLOWLISTED_ACCOUNTS", "").split(",") if s.strip()
+)
